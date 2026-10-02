@@ -45,6 +45,13 @@ def test_get_policy_limits_unknown_role():
     assert get_policy_limits("ceo")["error"] == "Unknown role"
 
 
+def test_intern_policy_has_no_eligible_items():
+    intern = get_policy_limits("intern")
+    assert intern["found"] is True
+    assert intern["eligible_items"] == {}
+    assert "not eligible" in intern["notes"]
+
+
 def test_approve_when_under_the_count_limit():
     result = check_request_eligibility("E002", "monitor")
     assert result["decision"] == "approve"
@@ -126,6 +133,38 @@ def test_accommodation_and_unknown_item_are_both_cited():
     assert result["decision"] == "escalate"
     assert "accommodation" in result["reason"]
     assert "catalog" in result["reason"]
+
+
+def test_synonym_display_approves_as_monitor():
+    result = check_request_eligibility("E002", "display")
+    assert result["decision"] == "approve"
+    assert result["normalized_item"] == "monitor"
+
+
+def test_accommodation_overrides_a_clear_approve():
+    result = check_request_eligibility(
+        "E002",
+        "monitor",
+        reason="a doctor asked for this",
+    )
+    assert result["decision"] == "escalate"
+    assert result["eligible"] is None
+    assert "accommodation" in result["reason"]
+
+
+def test_deny_headset_far_from_refresh():
+    result = check_request_eligibility("E005", "headset")
+    assert result["decision"] == "deny"
+    assert result["eligible"] is False
+    assert "0.5" in result["reason"]
+    assert "outside policy" in result["reason"]
+
+
+def test_approve_manager_dock_under_the_limit():
+    result = check_request_eligibility("E003", "dock")
+    assert result["decision"] == "approve"
+    assert result["normalized_item"] == "docking_station"
+    assert result["eligible"] is True
 
 
 def test_ambiguous_phrase_naming_two_items_escalates():

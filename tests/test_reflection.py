@@ -58,6 +58,13 @@ def test_parse_reflection_catches_a_revised_reply():
     assert "refresh window" in result["revised"]
 
 
+def test_parse_reflection_keeps_an_empty_revision():
+    result = parse_reflection('{"faithful": false, "issues": ["Decision line is missing."], "revised": ""}')
+    assert result["faithful"] is False
+    assert result["issues"] == ["Decision line is missing."]
+    assert result["revised"] == ""
+
+
 def test_parse_reflection_rejects_text_that_is_not_json():
     result = parse_reflection("The draft looks fine to me.")
     assert result["faithful"] is None
