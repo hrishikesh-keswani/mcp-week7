@@ -69,7 +69,7 @@ def _schema(tool: Any) -> dict:
     if schema is None and hasattr(tool, "model_dump"):
         dumped = tool.model_dump(by_alias=True)
         schema = dumped.get("inputSchema") or dumped.get("input_schema") or {}
-    if hasattr(schema, "model_dump"):
+    if schema is not None and hasattr(schema, "model_dump"):
         schema = schema.model_dump(by_alias=True)
     if not isinstance(schema, dict):
         return {"type": "object", "properties": {}}
@@ -319,7 +319,7 @@ async def run_request(session: ClientSession, request_text: str, ollama_tools: l
         observations["review"] = review
 
     print("-" * 72)
-    _print_block("Final decision", final_decision)
+    _print_block("Final decision", final_decision if final_decision is not None else "None")
     _print_block("Response", final_text)
     if isinstance(review, dict) and review.get("review_id"):
         _print_block("Escalation", f"{review['review_id']}: {review.get('reason', '')}")
@@ -339,12 +339,14 @@ async def run_request(session: ClientSession, request_text: str, ollama_tools: l
 
 
 async def run_requests(requests: list[str]) -> list[dict]:
-    async with stdio_client(server_parameters()) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            listed = await session.list_tools()
-            tools = _ollama_tools(listed.tools)
-            results = []
-            for request_text in requests:
-                results.append(await run_request(session, request_text, tools))
-            return results
+    async with (
+        stdio_client(server_parameters()) as (read, write),
+        ClientSession(read, write) as session,
+    ):
+        await session.initialize()
+        listed = await session.list_tools()
+        tools = _ollama_tools(listed.tools)
+        results = []
+        for request_text in requests:
+            results.append(await run_request(session, request_text, tools))
+        return results

@@ -30,15 +30,17 @@ def server_parameters() -> StdioServerParameters:
 
 async def main() -> None:
     os.environ.setdefault("PYTHONPATH", str(SRC))
-    async with stdio_client(server_parameters()) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            listed = await session.list_tools()
-            names = [tool.name for tool in listed.tools]
-            print("Registered tools:", ", ".join(names))
-            result = await session.call_tool("get_employee_info", {"employee_id": "E001"})
-            print("get_employee_info(E001):")
-            print(json.dumps(_payload(result), indent=2))
+    async with (
+        stdio_client(server_parameters()) as (read, write),
+        ClientSession(read, write) as session,
+    ):
+        await session.initialize()
+        listed = await session.list_tools()
+        names = [tool.name for tool in listed.tools]
+        print("Registered tools:", ", ".join(names))
+        result = await session.call_tool("get_employee_info", {"employee_id": "E001"})
+        print("get_employee_info(E001):")
+        print(json.dumps(_payload(result), indent=2))
 
 
 def _payload(result) -> object:

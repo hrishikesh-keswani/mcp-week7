@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 REFLECTION_PROMPT = """You are reviewing a drafted equipment-request decision. Do not call tools. Do not investigate the employee again.
 
@@ -89,8 +90,10 @@ def parse_reflection(text: str) -> dict:
     faithful = data.get("faithful")
     if isinstance(faithful, str):
         faithful = faithful.strip().lower() in {"true", "yes"}
-    issues = data.get("issues") if isinstance(data.get("issues"), list) else []
-    revised = data.get("revised") if isinstance(data.get("revised"), str) else ""
+    raw_issues = data.get("issues")
+    issues = raw_issues if isinstance(raw_issues, list) else []
+    raw_revised = data.get("revised")
+    revised = raw_revised if isinstance(raw_revised, str) else ""
     return {
         "faithful": bool(faithful) if faithful is not None else None,
         "issues": [str(issue) for issue in issues],

@@ -15,6 +15,8 @@ pip install -r requirements.txt
 ## Tests
 
 ```bash
+ruff check src agent tests
+mypy src agent tests
 pytest
 ```
 
