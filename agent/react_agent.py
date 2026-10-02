@@ -1,16 +1,17 @@
-"""ReAct agent: Thought, Action, Observation, then a reflection check.
+"""ReAct agent: Thought, Action, Observation, then a second model call.
 
-The model (Ollama, default qwen3:8b) chooses each MCP tool call. After it
-drafts a response, reflection compares that draft to the tool results. A
-consistency gate then keeps the final decision aligned with
-check_request_eligibility, and escalations are queued with
-flag_for_human_review when the model did not already do that.
+The model (Ollama, default qwen3:8b) chooses each MCP tool call and writes a
+draft. A second call, with no tools, reflects on that draft. If the model says
+the draft does not match the tool results, its revised response is the final
+text. Escalations are queued with flag_for_human_review when that has not
+already happened.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -25,11 +26,12 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from equipment_requests.reflection import canonical_response, verify_draft
+from equipment_requests.reflection import reflect
 
 OLLAMA_URL = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3:8b")
 MAX_STEPS = 8
+_DECISION_LINE = re.compile(r"decision\s*:\s*(approve|deny|escalat\w*)", re.IGNORECASE)
 
 SYSTEM_PROMPT = """You are an internal IT equipment-request agent. Investigate each request with tools. Do not invent policy numbers, counts, or ages.
 
@@ -109,15 +111,16 @@ def _payload(result: Any) -> dict:
     return {"value": parsed}
 
 
-def _ollama_chat(messages: list[dict], tools: list[dict]) -> dict:
-    body = {
+def _ollama_chat(messages: list[dict], tools: list[dict] | None = None) -> dict:
+    body: dict[str, Any] = {
         "model": OLLAMA_MODEL,
         "messages": messages,
-        "tools": tools,
         "stream": False,
-        "think": os.environ.get("OLLAMA_THINK", "true").lower() in {"1", "true", "yes"},
+        "think": os.environ.get("OLLAMA_THINK", "false").lower() in {"1", "true", "yes"},
         "options": {"temperature": 0},
     }
+    if tools:
+        body["tools"] = tools
     request = urllib.request.Request(
         f"{OLLAMA_URL}/api/chat",
         data=json.dumps(body).encode("utf-8"),
@@ -157,6 +160,14 @@ def _arguments(call: dict) -> dict:
 
 def _print_block(label: str, text: str) -> None:
     print(f"{label}: {text}")
+
+
+def _stated_decision(text: str) -> str | None:
+    match = _DECISION_LINE.search(text or "")
+    if not match:
+        return None
+    word = match.group(1).lower()
+    return "escalate" if word.startswith("escalat") else word
 
 
 def _remember(observations: dict, name: str, payload: dict) -> None:
@@ -204,14 +215,29 @@ async def run_request(session: ClientSession, request_text: str, ollama_tools: l
         trace.append({"step": step, "thought": thought, "tool_calls": tool_calls})
 
         if not tool_calls:
-            if observations["eligibility"] is None and step < MAX_STEPS:
+            eligibility = observations.get("eligibility")
+            needs_review = (
+                isinstance(eligibility, dict)
+                and eligibility.get("decision") == "escalate"
+                and not isinstance(observations.get("review"), dict)
+            )
+            if step < MAX_STEPS and (eligibility is None or needs_review):
                 messages.append(message)
-                follow_up = (
-                    "You have not called check_request_eligibility yet. "
-                    "Call the next tool you need. Do not give a final decision."
-                )
+                if eligibility is None:
+                    follow_up = (
+                        "You have not called check_request_eligibility yet. "
+                        "Call the next tool you need. Do not give a final decision."
+                    )
+                else:
+                    follow_up = (
+                        "check_request_eligibility returned escalate. "
+                        "Call flag_for_human_review now with the employee id, the original request, "
+                        "and the eligibility reason. After that tool returns, the draft must start "
+                        "with exactly: Decision: escalate"
+                    )
                 messages.append({"role": "user", "content": follow_up})
                 _print_block("Observation", follow_up)
+                trace.append({"observation_note": follow_up})
                 continue
             draft = message.get("content") or ""
             if isinstance(draft, list):
@@ -242,7 +268,7 @@ async def run_request(session: ClientSession, request_text: str, ollama_tools: l
                 tool_message["tool_call_id"] = call["id"]
             messages.append(tool_message)
 
-    reflection = verify_draft(draft, observations)
+    reflection = reflect(request_text, draft, observations, trace, _ollama_chat)
     print("-" * 72)
     _print_block(
         "Reflection",
@@ -251,27 +277,22 @@ async def run_request(session: ClientSession, request_text: str, ollama_tools: l
             indent=2,
         ),
     )
-
-    eligibility = observations.get("eligibility")
-    if not isinstance(eligibility, dict) or eligibility.get("decision") not in {"approve", "deny", "escalate"}:
-        final_decision = "escalate"
-        final_text = (
-            "Decision: escalate\n\n"
-            "check_request_eligibility did not return a decision, so this request is queued for review "
-            "instead of being approved or denied."
-        )
-        caught = True
-        print("Reflection caught the draft: eligibility was never confirmed, so the request is escalated.")
-    elif reflection["faithful"]:
-        final_decision = eligibility["decision"]
-        final_text = draft.strip() or canonical_response(eligibility)
+    if reflection["faithful"] is True:
+        final_text = draft.strip() or reflection["revised"] or "(empty draft)"
         caught = False
         print("Reflection confirmed the draft matches the tool results.")
-    else:
-        final_decision = eligibility["decision"]
-        final_text = canonical_response(eligibility)
+    elif reflection["revised"]:
+        final_text = reflection["revised"]
         caught = True
-        print("Reflection caught the draft and replaced it with the eligibility tool result.")
+        _print_block("Revised", reflection["revised"])
+        print("Reflection caught the draft and replaced it with the model's revised response.")
+    else:
+        final_text = draft.strip() or reflection["raw"] or "(empty draft)"
+        caught = reflection["faithful"] is False
+        print("Reflection did not return a revised response. The draft stands.")
+
+    final_decision = _stated_decision(final_text)
+    eligibility = observations.get("eligibility")
 
     review = observations.get("review")
     if final_decision == "escalate" and not isinstance(review, dict):

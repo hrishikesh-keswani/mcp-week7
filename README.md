@@ -2,7 +2,7 @@
 
 MCP server and local ReAct agent for employee equipment requests. Policy rules are in [docs/requirements.md](docs/requirements.md).
 
-The server exposes `get_employee_info`, `get_policy_limits`, `check_request_eligibility`, and `flag_for_human_review`. The agent uses Ollama (`qwen3:8b` by default) to choose tool calls, then checks its draft against those results before approving, denying, or escalating.
+The server exposes `get_employee_info`, `get_policy_limits`, `check_request_eligibility`, and `flag_for_human_review`. The agent uses Ollama (`qwen3:8b` by default) to choose tool calls and to write a draft. A second model call, with no tools, reflects on the request, the ReAct trace, the tool results, and the draft, and rewrites the draft when it does not match the tool results.
 
 ## Setup
 
@@ -32,4 +32,4 @@ Ollama must be running locally with the model pulled.
 python agent/demo.py
 ```
 
-`OLLAMA_MODEL` overrides the model. `OLLAMA_HOST` overrides the server URL. `OLLAMA_THINK=false` skips the model's thinking trace and keeps only the assistant text.
+`OLLAMA_MODEL` overrides the model. `OLLAMA_HOST` overrides the server URL. Thinking is off by default. `OLLAMA_THINK=true` turns the model's thinking trace back on.

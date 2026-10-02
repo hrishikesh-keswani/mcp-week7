@@ -1,91 +1,122 @@
-"""Check that a drafted response stays inside what the tools returned."""
+"""Second model call that reviews a drafted equipment decision.
+
+The agent passes a chat function. Tests cover the message that is sent and
+the parsing of the model's JSON reply. They do not call Ollama.
+"""
 
 from __future__ import annotations
 
 import json
 import re
+from typing import Any, Callable
 
-_INTERVAL = re.compile(
-    r"every\s+(\d+(?:\.\d+)?)\s+years?"
-    r"|(\d+(?:\.\d+)?)\s*-?\s*year\s+refresh"
-    r"|refresh(?:\s+interval)?\s+of\s+(\d+(?:\.\d+)?)\s+years?",
-    re.IGNORECASE,
-)
-_DECISION_LINE = re.compile(r"decision\s*:\s*(approve|deny|escalat\w*)", re.IGNORECASE)
+REFLECTION_PROMPT = """You are reviewing a drafted equipment-request decision. Do not call tools. Do not investigate the employee again.
 
+Compare the draft with the tool results. The draft is faithful only when both are true:
+- its Decision line matches check_request_eligibility
+- every fact it states appears in the tool results
 
-def _stated_decision(draft: str) -> str | None:
-    match = _DECISION_LINE.search(draft)
-    if match:
-        word = match.group(1).lower()
-        return "escalate" if word.startswith("escalat") else word
-    text = draft.lower()
-    if "escalat" in text:
-        return "escalate"
-    if re.search(r"\b(denied|deny|denied)\b", text) or "not eligible" in text or "outside policy" in text:
-        return "deny"
-    if re.search(r"\b(approved|approve)\b", text):
-        return "approve"
-    return None
+It is not faithful if it adds a reason, number, age, count, or accommodation the tools did not return.
+
+Reply with JSON only, no markdown:
+{"faithful": true, "issues": [], "revised": "Decision: approve"}
+or
+{"faithful": false, "issues": ["what the draft added or changed"], "revised": "Decision: escalate\\n\\nreplacement text"}
+
+When faithful is false, revised must start with Decision: approve, Decision: deny, or Decision: escalate, and may use only facts from the tool results.
+"""
 
 
-def _refresh_years(policy: dict | None) -> set[float]:
-    if not policy:
-        return set()
-    items = policy.get("eligible_items") or {}
-    years: set[float] = set()
-    for spec in items.values():
-        if isinstance(spec, dict) and "refresh_years" in spec:
-            years.add(float(spec["refresh_years"]))
-    return years
+def trace_text(trace: list[dict]) -> str:
+    """Format the ReAct loop as Thought, Action, and Observation lines."""
+    lines: list[str] = []
+    for item in trace:
+        if item.get("thought"):
+            lines.append(f"Thought: {item['thought']}")
+        if item.get("action"):
+            lines.append(f"Action: {item['action']} {json.dumps(item.get('arguments') or {})}")
+            lines.append("Observation: " + json.dumps(item.get("observation"), indent=2))
+        elif item.get("observation_note"):
+            lines.append(f"Observation: {item['observation_note']}")
+    return "\n".join(lines) or "(no trace)"
 
 
-def _claimed_intervals(draft: str) -> list[float]:
-    claimed: list[float] = []
-    for match in _INTERVAL.finditer(draft):
-        raw = next(group for group in match.groups() if group is not None)
-        claimed.append(float(raw))
-    return claimed
+def reflection_messages(
+    request_text: str,
+    draft: str,
+    observations: dict,
+    trace: list[dict],
+) -> list[dict]:
+    """Build the system and user messages for the reflection call."""
+    tool_results = {
+        "employee": observations.get("employee"),
+        "policy": observations.get("policy"),
+        "eligibility": observations.get("eligibility"),
+    }
+    user = (
+        "Employee request:\n"
+        + request_text.strip()
+        + "\n\nReAct trace:\n"
+        + trace_text(trace)
+        + "\n\nTool results:\n"
+        + json.dumps(tool_results, indent=2)
+        + "\n\nDraft:\n"
+        + (draft.strip() or "(empty draft)")
+    )
+    return [
+        {"role": "system", "content": REFLECTION_PROMPT},
+        {"role": "user", "content": user},
+    ]
 
 
-def verify_draft(draft: str, observations: dict) -> dict:
-    """Return whether ``draft`` agrees with employee, policy, and eligibility results.
+def parse_reflection(text: str) -> dict:
+    """Read faithful, issues, and revised from the model's reply."""
+    raw = text.strip()
+    fenced = re.search(r"```(?:json)?\s*(\{.*\})\s*```", raw, re.DOTALL)
+    if fenced:
+        raw = fenced.group(1)
+    else:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start != -1 and end > start:
+            raw = raw[start : end + 1]
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    faithful = data.get("faithful")
+    if isinstance(faithful, str):
+        faithful = faithful.strip().lower() in {"true", "yes"}
+    issues = data.get("issues") if isinstance(data.get("issues"), list) else []
+    revised = data.get("revised") if isinstance(data.get("revised"), str) else ""
+    return {
+        "faithful": bool(faithful) if faithful is not None else None,
+        "issues": [str(issue) for issue in issues],
+        "revised": revised.strip(),
+        "raw": text.strip(),
+    }
 
-    Interval claims must match a ``refresh_years`` value the policy tool returned.
-    The stated decision must match ``check_request_eligibility``.
+
+def _message_text(message: dict) -> str:
+    content = message.get("content") or ""
+    if isinstance(content, list):
+        content = " ".join(str(part) for part in content)
+    return str(content).strip() or str(message.get("thinking") or "").strip()
+
+
+def reflect(
+    request_text: str,
+    draft: str,
+    observations: dict,
+    trace: list[dict],
+    chat: Callable[[list[dict]], dict],
+) -> dict:
+    """Send the draft and the loop to the model and return its review.
+
+    ``chat`` is the agent's Ollama call. It receives the reflection messages
+    and must not be given tools.
     """
-    issues: list[str] = []
-    eligibility = observations.get("eligibility") or {}
-    decision = eligibility.get("decision")
-    stated = _stated_decision(draft)
-
-    if decision not in {"approve", "deny", "escalate"}:
-        issues.append("Draft cannot be checked because check_request_eligibility did not return a decision.")
-    elif stated is None:
-        issues.append("Draft does not state an approve, deny, or escalate decision.")
-    elif stated != decision:
-        issues.append(
-            f"Draft says {stated}, but check_request_eligibility returned {decision}."
-        )
-
-    allowed = _refresh_years(observations.get("policy"))
-    for years in _claimed_intervals(draft):
-        if not any(abs(years - allowed_year) < 1e-9 for allowed_year in allowed):
-            issues.append(
-                f"Draft states a refresh interval of {years:g} years that the policy tool did not return."
-            )
-
-    observed = json.dumps(observations).lower()
-    if re.search(r"accommodat", draft, re.IGNORECASE) and "accommodat" not in observed:
-        issues.append(
-            "Draft describes an accommodation, which the tool results do not mention."
-        )
-
-    return {"faithful": not issues, "issues": issues, "stated_decision": stated}
-
-
-def canonical_response(eligibility: dict) -> str:
-    """A response that uses only the eligibility tool's decision and reason."""
-    decision = eligibility["decision"]
-    reason = eligibility["reason"]
-    return f"Decision: {decision}\n\n{reason}"
+    reply: dict[str, Any] = chat(reflection_messages(request_text, draft, observations, trace))
+    return parse_reflection(_message_text(reply.get("message") or {}))
